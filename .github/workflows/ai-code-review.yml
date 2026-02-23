@@ -1,0 +1,79 @@
+name: "🤖 AI Code Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Get PR diff
+        id: get_diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the diff between PR branch and base
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...HEAD -- '*.py' '*.js' '*.ts' '*.java' '*.go' '*.rs' '*.cpp' '*.c' '*.rb' '*.php' | head -c 8000)
+          
+          # Save diff to file (avoids shell escaping issues)
+          echo "$DIFF" > /tmp/pr_diff.txt
+          
+          if [ -z "$DIFF" ]; then
+            echo "no_code_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "no_code_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run AI Code Review
+        if: steps.get_diff.outputs.no_code_changes == 'false'
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python src/review.py /tmp/pr_diff.txt > /tmp/review_output.txt 2>&1
+          
+          # Extract just the review (everything before "--- Metrics ---")
+          REVIEW=$(sed '/^--- Metrics ---$/,$d' /tmp/review_output.txt | tail -n +2)
+          
+          # Save review for next step
+          echo "$REVIEW" > /tmp/review_comment.txt
+
+      - name: Post Review Comment
+        if: steps.get_diff.outputs.no_code_changes == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read the review
+          REVIEW=$(cat /tmp/review_comment.txt)
+          
+          # Create the comment body
+          COMMENT="$REVIEW
+
+          ---
+          *🤖 Automated review by [AI Code Review Bot](https://github.com/ajay-automates/ai-code-review-bot) | Powered by Claude*"
+          
+          # Post as PR comment using GitHub CLI
+          gh pr comment ${{ github.event.pull_request.number }} --body "$COMMENT"
+
+      - name: Skip Review (no code changes)
+        if: steps.get_diff.outputs.no_code_changes == 'true'
+        run: echo "No code file changes detected in this PR. Skipping AI review."
